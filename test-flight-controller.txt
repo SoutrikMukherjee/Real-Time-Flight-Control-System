@@ -1,0 +1,345 @@
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
+#include <chrono>
+#include <thread>
+
+#include "rtfcs/flight_controller.hpp"
+#include "rtfcs/hardware_interface.hpp"
+#include "test_helpers.hpp"
+
+using namespace rtfcs;
+using namespace testing;
+using namespace std::chrono_literals;
+
+/**
+ * @brief Mock hardware interface for testing
+ */
+class MockHardwareInterface : public HardwareInterface {
+public:
+    MOCK_METHOD(bool, initialize, (), (override));
+    MOCK_METHOD(IMUData, readIMU, (), (override));
+    MOCK_METHOD(BarometerData, readBarometer, (), (override));
+    MOCK_METHOD(GPSPosition, readGPS, (), (override));
+    MOCK_METHOD(double, readBatteryVoltage, (), (override));
+    MOCK_METHOD(void, setMotorOutputs, (const std::array<double, 8>&), (override));
+    MOCK_METHOD(PilotInput, getPilotInput, (), (override));
+};
+
+/**
+ * @brief Test fixture for FlightController tests
+ */
+class FlightControllerTest : public Test {
+protected:
+    void SetUp() override {
+        // Create mock hardware interface
+        mock_hw_ = std::make_shared<MockHardwareInterface>();
+        HardwareInterface::setInstance(mock_hw_);
+        
+        // Setup default expectations
+        EXPECT_CALL(*mock_hw_, initialize()).WillOnce(Return(true));
+        
+        // Default sensor readings
+        IMUData default_imu;
+        default_imu.accelerometer = {0, 0, -9.81};  // Gravity
+        default_imu.gyroscope = {0, 0, 0};
+        default_imu.magnetometer = {0.2, 0, 0.4};
+        
+        BarometerData default_baro;
+        default_baro.pressure_pa = 101325;
+        default_baro.altitude_m = 0;
+        
+        GPSPosition default_gps;
+        default_gps.latitude_deg = 47.3977;
+        default_gps.longitude_deg = 8.5456;
+        default_gps.altitude_m = 400;
+        default_gps.fix_type = 3;
+        default_gps.num_satellites = 12;
+        
+        EXPECT_CALL(*mock_hw_, readIMU())
+            .WillRepeatedly(Return(default_imu));
+        EXPECT_CALL(*mock_hw_, readBarometer())
+            .WillRepeatedly(Return(default_baro));
+        EXPECT_CALL(*mock_hw_, readGPS())
+            .WillRepeatedly(Return(default_gps));
+        EXPECT_CALL(*mock_hw_, readBatteryVoltage())
+            .WillRepeatedly(Return(16.8));  // Full 4S battery
+        
+        // Create flight controller
+        fc_ = std::make_unique<FlightController>();
+    }
+    
+    void TearDown() override {
+        fc_.reset();
+        HardwareInterface::resetInstance();
+    }
+    
+    std::unique_ptr<FlightController> fc_;
+    std::shared_ptr<MockHardwareInterface> mock_hw_;
+};
+
+/**
+ * @brief Test basic initialization
+ */
+TEST_F(FlightControllerTest, Initialization) {
+    EXPECT_TRUE(fc_->initialize("config/test_config.yaml"));
+    
+    auto status = fc_->getStatus();
+    EXPECT_EQ(status.mode, FlightController::FlightMode::MANUAL);
+    EXPECT_FALSE(status.armed);
+    EXPECT_FALSE(status.flying);
+    EXPECT_EQ(status.system_health, 100);
+}
+
+/**
+ * @brief Test control loop frequency
+ */
+TEST_F(FlightControllerTest, ControlLoopFrequency) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    
+    // Expect motor outputs at 1000Hz
+    std::atomic<int> call_count{0};
+    EXPECT_CALL(*mock_hw_, setMotorOutputs(_))
+        .WillRepeatedly([&call_count](const auto&) { call_count++; });
+    
+    ASSERT_TRUE(fc_->start());
+    
+    // Run for 100ms
+    std::this_thread::sleep_for(100ms);
+    
+    fc_->stop();
+    
+    // Should have ~100 calls (1000Hz for 100ms)
+    // Allow 5% tolerance for timing variations
+    EXPECT_NEAR(call_count, 100, 5);
+}
+
+/**
+ * @brief Test arming sequence
+ */
+TEST_F(FlightControllerTest, ArmingSequence) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    ASSERT_TRUE(fc_->start());
+    
+    // Wait for sensor fusion to stabilize
+    std::this_thread::sleep_for(50ms);
+    
+    // Should arm successfully with good conditions
+    EXPECT_TRUE(fc_->arm());
+    
+    auto status = fc_->getStatus();
+    EXPECT_TRUE(status.armed);
+    
+    // Test disarm
+    fc_->disarm();
+    status = fc_->getStatus();
+    EXPECT_FALSE(status.armed);
+    
+    fc_->stop();
+}
+
+/**
+ * @brief Test arming with low battery
+ */
+TEST_F(FlightControllerTest, ArmingLowBattery) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    
+    // Set low battery voltage
+    EXPECT_CALL(*mock_hw_, readBatteryVoltage())
+        .WillRepeatedly(Return(13.5));  // Low 4S battery
+    
+    ASSERT_TRUE(fc_->start());
+    std::this_thread::sleep_for(50ms);
+    
+    // Should fail to arm
+    EXPECT_FALSE(fc_->arm());
+    
+    fc_->stop();
+}
+
+/**
+ * @brief Test mode transitions
+ */
+TEST_F(FlightControllerTest, ModeTransitions) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    ASSERT_TRUE(fc_->start());
+    
+    // Start in manual mode
+    EXPECT_EQ(fc_->getStatus().mode, FlightController::FlightMode::MANUAL);
+    
+    // Transition to stabilize
+    EXPECT_TRUE(fc_->setFlightMode(FlightController::FlightMode::STABILIZE));
+    EXPECT_EQ(fc_->getStatus().mode, FlightController::FlightMode::STABILIZE);
+    
+    // Must be armed for position hold
+    EXPECT_TRUE(fc_->arm());
+    EXPECT_TRUE(fc_->setFlightMode(FlightController::FlightMode::POSITION_HOLD));
+    EXPECT_EQ(fc_->getStatus().mode, FlightController::FlightMode::POSITION_HOLD);
+    
+    fc_->stop();
+}
+
+/**
+ * @brief Test emergency stop
+ */
+TEST_F(FlightControllerTest, EmergencyStop) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    ASSERT_TRUE(fc_->start());
+    ASSERT_TRUE(fc_->arm());
+    
+    // Expect all motors to be zeroed
+    std::array<double, 8> zero_outputs{};
+    EXPECT_CALL(*mock_hw_, setMotorOutputs(zero_outputs))
+        .Times(AtLeast(1));
+    
+    fc_->emergencyStop();
+    
+    // Should be disarmed
+    EXPECT_FALSE(fc_->getStatus().armed);
+    
+    fc_->stop();
+}
+
+/**
+ * @brief Test mission execution
+ */
+TEST_F(FlightControllerTest, MissionExecution) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    ASSERT_TRUE(fc_->start());
+    ASSERT_TRUE(fc_->arm());
+    
+    // Create simple mission
+    Mission mission;
+    mission.addWaypoint({47.3980, 8.5460, 450.0}, 10.0);
+    mission.addWaypoint({47.3985, 8.5465, 500.0}, 15.0);
+    
+    // Execute mission
+    EXPECT_TRUE(fc_->executeMission(mission));
+    EXPECT_EQ(fc_->getStatus().mode, FlightController::FlightMode::AUTONOMOUS);
+    
+    fc_->stop();
+}
+
+/**
+ * @brief Test telemetry output
+ */
+TEST_F(FlightControllerTest, TelemetryOutput) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    
+    std::atomic<int> telemetry_count{0};
+    TelemetryData last_telem;
+    
+    fc_->setTelemetryCallback([&](const TelemetryData& data) {
+        telemetry_count++;
+        last_telem = data;
+    });
+    
+    ASSERT_TRUE(fc_->start());
+    
+    // Wait for telemetry (10Hz)
+    std::this_thread::sleep_for(250ms);
+    
+    fc_->stop();
+    
+    // Should have ~2-3 telemetry packets
+    EXPECT_GE(telemetry_count, 2);
+    EXPECT_LE(telemetry_count, 4);
+    
+    // Check telemetry data
+    EXPECT_GT(last_telem.timestamp_us, 0);
+    EXPECT_EQ(last_telem.flight_mode, 
+              static_cast<uint8_t>(FlightController::FlightMode::MANUAL));
+}
+
+/**
+ * @brief Test failsafe behavior
+ */
+TEST_F(FlightControllerTest, FailsafeBehavior) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    ASSERT_TRUE(fc_->start());
+    ASSERT_TRUE(fc_->arm());
+    
+    // Set altitude to indicate flying
+    BarometerData high_altitude;
+    high_altitude.pressure_pa = 90000;  // ~1000m altitude
+    high_altitude.altitude_m = 1000;
+    
+    EXPECT_CALL(*mock_hw_, readBarometer())
+        .WillRepeatedly(Return(high_altitude));
+    
+    // Simulate GPS loss
+    GPSPosition no_gps;
+    no_gps.fix_type = 0;
+    no_gps.num_satellites = 0;
+    
+    EXPECT_CALL(*mock_hw_, readGPS())
+        .WillRepeatedly(Return(no_gps));
+    
+    // Wait for failsafe to trigger
+    std::this_thread::sleep_for(200ms);
+    
+    // Should enter emergency land mode
+    EXPECT_EQ(fc_->getStatus().mode, 
+              FlightController::FlightMode::EMERGENCY_LAND);
+    
+    fc_->stop();
+}
+
+/**
+ * @brief Performance benchmark test
+ */
+TEST_F(FlightControllerTest, PerformanceBenchmark) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    
+    // Track performance metrics
+    std::vector<double> execution_times;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    ASSERT_TRUE(fc_->start());
+    ASSERT_TRUE(fc_->arm());
+    
+    // Run for 1 second
+    std::this_thread::sleep_for(1s);
+    
+    fc_->stop();
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time).count();
+    
+    // Verify timing
+    EXPECT_NEAR(duration, 1000, 50);  // 50ms tolerance
+    
+    // Get final status
+    auto status = fc_->getStatus();
+    EXPECT_EQ(status.system_health, 100);
+}
+
+/**
+ * @brief Test redundancy handling
+ */
+TEST_F(FlightControllerTest, RedundancyHandling) {
+    ASSERT_TRUE(fc_->initialize("config/test_config.yaml"));
+    ASSERT_TRUE(fc_->start());
+    
+    // Simulate sensor failure by returning inconsistent data
+    int call_count = 0;
+    EXPECT_CALL(*mock_hw_, readIMU())
+        .WillRepeatedly([&call_count]() {
+            IMUData imu;
+            if (call_count++ % 10 == 0) {
+                // Inject bad data occasionally
+                imu.accelerometer = {100, 100, 100};  // Unrealistic
+            } else {
+                imu.accelerometer = {0, 0, -9.81};
+            }
+            imu.gyroscope = {0, 0, 0};
+            return imu;
+        });
+    
+    std::this_thread::sleep_for(200ms);
+    
+    // System should remain healthy despite bad data
+    EXPECT_GE(fc_->getStatus().system_health, 70);
+    
+    fc_->stop();
+}

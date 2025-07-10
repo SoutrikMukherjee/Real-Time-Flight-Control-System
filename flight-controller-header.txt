@@ -1,0 +1,232 @@
+#ifndef RTFCS_FLIGHT_CONTROLLER_HPP
+#define RTFCS_FLIGHT_CONTROLLER_HPP
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <array>
+#include <mutex>
+
+#include "rtfcs/types.hpp"
+#include "rtfcs/attitude_controller.hpp"
+#include "rtfcs/position_controller.hpp"
+#include "rtfcs/sensor_fusion.hpp"
+#include "rtfcs/safety_monitor.hpp"
+#include "rtfcs/mission_planner.hpp"
+#include "rtfcs/telemetry.hpp"
+
+namespace rtfcs {
+
+/**
+ * @brief Main flight controller class implementing real-time control loops
+ * 
+ * This class orchestrates all flight control subsystems and ensures
+ * deterministic real-time execution at 1000Hz for critical control loops.
+ */
+class FlightController {
+public:
+    /**
+     * @brief Flight modes supported by the controller
+     */
+    enum class FlightMode {
+        MANUAL,           ///< Direct pilot control
+        STABILIZE,        ///< Attitude stabilization only
+        ALTITUDE_HOLD,    ///< Altitude and attitude hold
+        POSITION_HOLD,    ///< Full position hold
+        AUTONOMOUS,       ///< Fully autonomous mission execution
+        RETURN_TO_HOME,   ///< Automatic return to launch point
+        EMERGENCY_LAND    ///< Emergency landing mode
+    };
+
+    /**
+     * @brief Controller status structure
+     */
+    struct Status {
+        FlightMode mode;
+        bool armed;
+        bool flying;
+        double altitude_m;
+        double groundspeed_ms;
+        double battery_voltage;
+        uint32_t flight_time_ms;
+        Position3D position;
+        Attitude attitude;
+        uint8_t gps_satellites;
+        uint8_t system_health;  ///< 0-100 health score
+    };
+
+    FlightController();
+    ~FlightController();
+
+    /**
+     * @brief Initialize the flight controller with configuration
+     * @param config_path Path to YAML configuration file
+     * @return true if initialization successful
+     */
+    bool initialize(const std::string& config_path);
+
+    /**
+     * @brief Start the real-time control loops
+     * @return true if started successfully
+     */
+    bool start();
+
+    /**
+     * @brief Stop all control loops
+     */
+    void stop();
+
+    /**
+     * @brief Arm the vehicle for flight
+     * @return true if arming successful
+     */
+    bool arm();
+
+    /**
+     * @brief Disarm the vehicle
+     */
+    void disarm();
+
+    /**
+     * @brief Set the flight mode
+     * @param mode Desired flight mode
+     * @return true if mode change successful
+     */
+    bool setFlightMode(FlightMode mode);
+
+    /**
+     * @brief Execute an autonomous mission
+     * @param mission Mission to execute
+     * @return true if mission started successfully
+     */
+    bool executeMission(const Mission& mission);
+
+    /**
+     * @brief Get current controller status
+     * @return Current status structure
+     */
+    Status getStatus() const;
+
+    /**
+     * @brief Check if vehicle is currently flying
+     * @return true if in flight
+     */
+    bool isFlying() const { return status_.flying; }
+
+    /**
+     * @brief Emergency stop - immediate motor shutdown
+     */
+    void emergencyStop();
+
+    /**
+     * @brief Set telemetry callback for external monitoring
+     * @param callback Function to call with telemetry data
+     */
+    void setTelemetryCallback(std::function<void(const TelemetryData&)> callback);
+
+private:
+    /**
+     * @brief Main control loop running at 1000Hz
+     */
+    void controlLoop();
+
+    /**
+     * @brief Navigation loop running at 50Hz
+     */
+    void navigationLoop();
+
+    /**
+     * @brief Telemetry loop running at 10Hz
+     */
+    void telemetryLoop();
+
+    /**
+     * @brief Update sensor readings
+     */
+    void updateSensors();
+
+    /**
+     * @brief Run attitude control algorithms
+     */
+    void runAttitudeControl();
+
+    /**
+     * @brief Run position control algorithms
+     */
+    void runPositionControl();
+
+    /**
+     * @brief Update actuator outputs
+     */
+    void updateActuators();
+
+    /**
+     * @brief Check system health and safety
+     * @return true if system is healthy
+     */
+    bool checkSystemHealth();
+
+    /**
+     * @brief Handle failsafe conditions
+     */
+    void handleFailsafe();
+
+    // Core components
+    std::unique_ptr<AttitudeController> attitude_controller_;
+    std::unique_ptr<PositionController> position_controller_;
+    std::unique_ptr<SensorFusion> sensor_fusion_;
+    std::unique_ptr<SafetyMonitor> safety_monitor_;
+    std::unique_ptr<MissionPlanner> mission_planner_;
+    std::unique_ptr<Telemetry> telemetry_;
+
+    // Thread management
+    std::thread control_thread_;
+    std::thread navigation_thread_;
+    std::thread telemetry_thread_;
+    std::atomic<bool> running_{false};
+
+    // Timing
+    std::chrono::high_resolution_clock::time_point last_control_time_;
+    std::chrono::high_resolution_clock::time_point start_time_;
+    static constexpr auto CONTROL_PERIOD = std::chrono::microseconds(1000);  // 1000Hz
+    static constexpr auto NAV_PERIOD = std::chrono::milliseconds(20);       // 50Hz
+    static constexpr auto TELEMETRY_PERIOD = std::chrono::milliseconds(100); // 10Hz
+
+    // State
+    mutable std::mutex status_mutex_;
+    Status status_;
+    std::atomic<bool> armed_{false};
+    
+    // Control outputs
+    std::array<double, 8> motor_outputs_{};  // Support up to 8 motors
+    std::array<double, 8> servo_outputs_{};  // Support up to 8 servos
+
+    // Performance monitoring
+    struct PerformanceMetrics {
+        uint64_t control_cycles{0};
+        uint64_t missed_deadlines{0};
+        double avg_execution_time_us{0};
+        double max_execution_time_us{0};
+        double cpu_usage_percent{0};
+    } perf_metrics_;
+
+    // Configuration
+    struct Config {
+        bool enable_redundancy{true};
+        bool enable_logging{true};
+        uint32_t imu_sample_rate_hz{1000};
+        uint32_t gps_sample_rate_hz{25};
+        std::string vehicle_type{"quadcopter"};
+        double max_roll_deg{45.0};
+        double max_pitch_deg{45.0};
+        double max_yaw_rate_dps{180.0};
+        double max_climb_rate_ms{10.0};
+        double max_velocity_ms{20.0};
+    } config_;
+};
+
+} // namespace rtfcs
+
+#endif // RTFCS_FLIGHT_CONTROLLER_HPP

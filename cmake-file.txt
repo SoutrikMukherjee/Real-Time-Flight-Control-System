@@ -1,0 +1,224 @@
+cmake_minimum_required(VERSION 3.16)
+project(RTFCS VERSION 2.3.1 LANGUAGES CXX)
+
+# C++ Standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Options
+option(ENABLE_REDUNDANCY "Enable triple redundancy for critical components" ON)
+option(ENABLE_TESTS "Build unit tests" ON)
+option(ENABLE_DOCS "Build documentation" ON)
+option(ENABLE_HARDWARE_HIL "Enable hardware-in-the-loop testing" OFF)
+option(TARGET_PLATFORM "Target platform (ARM_CORTEX_A72, X86_64, SITL)" "ARM_CORTEX_A72")
+
+# Compiler flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+
+# Safety-critical compilation flags
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wconversion -Wshadow")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wcast-align -Wformat=2")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fstack-protector-strong")
+endif()
+
+# Platform-specific settings
+if(TARGET_PLATFORM STREQUAL "ARM_CORTEX_A72")
+    set(CMAKE_SYSTEM_NAME Linux)
+    set(CMAKE_SYSTEM_PROCESSOR aarch64)
+    set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+    set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=cortex-a72")
+endif()
+
+# Find packages
+find_package(Threads REQUIRED)
+find_package(Boost 1.71.0 REQUIRED COMPONENTS system filesystem program_options)
+
+# FreeRTOS
+if(NOT TARGET_PLATFORM STREQUAL "SITL")
+    set(FREERTOS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/FreeRTOS)
+    add_subdirectory(${FREERTOS_DIR})
+endif()
+
+# Include directories
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    ${Boost_INCLUDE_DIRS}
+)
+
+# Source files
+set(CORE_SOURCES
+    src/flight_controller.cpp
+    src/attitude_controller.cpp
+    src/position_controller.cpp
+    src/sensor_fusion.cpp
+    src/safety_monitor.cpp
+    src/mission_planner.cpp
+    src/telemetry.cpp
+    src/logger.cpp
+    src/config_parser.cpp
+    src/hardware_interface.cpp
+)
+
+set(SENSOR_SOURCES
+    src/sensors/imu_driver.cpp
+    src/sensors/gps_driver.cpp
+    src/sensors/barometer_driver.cpp
+    src/sensors/magnetometer_driver.cpp
+    src/sensors/rangefinder_driver.cpp
+)
+
+set(CONTROL_SOURCES
+    src/control/pid_controller.cpp
+    src/control/adaptive_controller.cpp
+    src/control/motor_mixer.cpp
+    src/control/trajectory_generator.cpp
+)
+
+set(NAVIGATION_SOURCES
+    src/navigation/waypoint_navigator.cpp
+    src/navigation/obstacle_avoidance.cpp
+    src/navigation/path_planner.cpp
+    src/navigation/geofence.cpp
+)
+
+set(FILTER_SOURCES
+    src/filters/kalman_filter.cpp
+    src/filters/complementary_filter.cpp
+    src/filters/notch_filter.cpp
+    src/filters/low_pass_filter.cpp
+)
+
+# Main library
+add_library(rtfcs_core STATIC
+    ${CORE_SOURCES}
+    ${SENSOR_SOURCES}
+    ${CONTROL_SOURCES}
+    ${NAVIGATION_SOURCES}
+    ${FILTER_SOURCES}
+)
+
+target_link_libraries(rtfcs_core
+    PUBLIC
+        Threads::Threads
+        ${Boost_LIBRARIES}
+        m
+        rt
+    PRIVATE
+        $<$<NOT:$<STREQUAL:${TARGET_PLATFORM},SITL>>:freertos>
+)
+
+# Main executable
+add_executable(rtfcs_flight_controller
+    src/main.cpp
+)
+
+target_link_libraries(rtfcs_flight_controller
+    PRIVATE
+        rtfcs_core
+)
+
+# Test executable
+if(ENABLE_TESTS)
+    enable_testing()
+    add_subdirectory(third_party/googletest)
+    
+    set(TEST_SOURCES
+        tests/test_main.cpp
+        tests/test_flight_controller.cpp
+        tests/test_attitude_controller.cpp
+        tests/test_position_controller.cpp
+        tests/test_sensor_fusion.cpp
+        tests/test_safety_monitor.cpp
+        tests/test_filters.cpp
+        tests/test_navigation.cpp
+    )
+    
+    add_executable(rtfcs_tests ${TEST_SOURCES})
+    
+    target_link_libraries(rtfcs_tests
+        PRIVATE
+            rtfcs_core
+            gtest
+            gmock
+    )
+    
+    add_test(NAME rtfcs_tests COMMAND rtfcs_tests)
+    
+    # Coverage
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(rtfcs_tests PRIVATE --coverage)
+        target_link_options(rtfcs_tests PRIVATE --coverage)
+    endif()
+endif()
+
+# Documentation
+if(ENABLE_DOCS)
+    find_package(Doxygen REQUIRED)
+    
+    set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/docs/Doxyfile.in)
+    set(DOXYGEN_OUT ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
+    
+    configure_file(${DOXYGEN_IN} ${DOXYGEN_OUT} @ONLY)
+    
+    add_custom_target(docs
+        COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_OUT}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Generating API documentation with Doxygen"
+        VERBATIM
+    )
+endif()
+
+# Installation
+install(TARGETS rtfcs_flight_controller
+    RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/rtfcs
+    DESTINATION include
+)
+
+install(FILES
+    scripts/deploy.sh
+    scripts/configure.py
+    scripts/pre-commit.sh
+    DESTINATION scripts
+    PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ
+                GROUP_EXECUTE GROUP_READ
+                WORLD_EXECUTE WORLD_READ
+)
+
+install(FILES
+    config/quadcopter_default.yaml
+    config/fixedwing_default.yaml
+    config/safety_limits.yaml
+    DESTINATION etc/rtfcs
+)
+
+# Package configuration
+include(CPack)
+set(CPACK_PACKAGE_NAME "RTFCS")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_DESCRIPTION "Real-Time Flight Control System")
+set(CPACK_PACKAGE_CONTACT "s.chen@rtfcs.org")
+set(CPACK_GENERATOR "DEB;RPM;TGZ")
+
+# Status messages
+message(STATUS "RTFCS Configuration:")
+message(STATUS "  Version: ${PROJECT_VERSION}")
+message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Target Platform: ${TARGET_PLATFORM}")
+message(STATUS "  Redundancy: ${ENABLE_REDUNDANCY}")
+message(STATUS "  Tests: ${ENABLE_TESTS}")
+message(STATUS "  Documentation: ${ENABLE_DOCS}")

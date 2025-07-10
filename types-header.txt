@@ -1,0 +1,247 @@
+#ifndef RTFCS_TYPES_HPP
+#define RTFCS_TYPES_HPP
+
+#include <cstdint>
+#include <array>
+#include <vector>
+#include <chrono>
+
+namespace rtfcs {
+
+/**
+ * @brief 3D position in NED (North-East-Down) frame
+ */
+struct Position3D {
+    double north_m;     ///< North position in meters
+    double east_m;      ///< East position in meters  
+    double down_m;      ///< Down position in meters (negative is up)
+    
+    Position3D() : north_m(0), east_m(0), down_m(0) {}
+    Position3D(double n, double e, double d) : north_m(n), east_m(e), down_m(d) {}
+};
+
+/**
+ * @brief GPS position in WGS84
+ */
+struct GPSPosition {
+    double latitude_deg;   ///< Latitude in degrees
+    double longitude_deg;  ///< Longitude in degrees
+    double altitude_m;     ///< Altitude above MSL in meters
+    uint8_t fix_type;      ///< 0=No fix, 1=2D, 2=3D, 3=3D+DGPS, 4=RTK
+    uint8_t num_satellites;
+    double hdop;           ///< Horizontal dilution of precision
+    
+    GPSPosition() : latitude_deg(0), longitude_deg(0), altitude_m(0), 
+                    fix_type(0), num_satellites(0), hdop(99.9) {}
+};
+
+/**
+ * @brief 3D velocity in NED frame
+ */
+struct Velocity3D {
+    double north_ms;    ///< North velocity in m/s
+    double east_ms;     ///< East velocity in m/s
+    double down_ms;     ///< Down velocity in m/s
+    
+    Velocity3D() : north_ms(0), east_ms(0), down_ms(0) {}
+    Velocity3D(double n, double e, double d) : north_ms(n), east_ms(e), down_ms(d) {}
+};
+
+/**
+ * @brief Vehicle attitude (orientation)
+ */
+struct Attitude {
+    double roll_rad;    ///< Roll angle in radians
+    double pitch_rad;   ///< Pitch angle in radians
+    double yaw_rad;     ///< Yaw angle in radians
+    
+    Attitude() : roll_rad(0), pitch_rad(0), yaw_rad(0) {}
+    Attitude(double r, double p, double y) : roll_rad(r), pitch_rad(p), yaw_rad(y) {}
+};
+
+/**
+ * @brief Angular rates
+ */
+struct AngularRates {
+    double roll_rate_rads;   ///< Roll rate in rad/s
+    double pitch_rate_rads;  ///< Pitch rate in rad/s
+    double yaw_rate_rads;    ///< Yaw rate in rad/s
+    
+    AngularRates() : roll_rate_rads(0), pitch_rate_rads(0), yaw_rate_rads(0) {}
+};
+
+/**
+ * @brief IMU sensor data
+ */
+struct IMUData {
+    std::array<double, 3> accelerometer;  ///< Acceleration in m/s² [x,y,z]
+    std::array<double, 3> gyroscope;      ///< Angular rates in rad/s [x,y,z]
+    std::array<double, 3> magnetometer;   ///< Magnetic field in Gauss [x,y,z]
+    double temperature_c;                  ///< Temperature in Celsius
+    uint64_t timestamp_us;                 ///< Microsecond timestamp
+    
+    IMUData() : accelerometer{}, gyroscope{}, magnetometer{}, 
+                temperature_c(0), timestamp_us(0) {}
+};
+
+/**
+ * @brief Barometer sensor data
+ */
+struct BarometerData {
+    double pressure_pa;      ///< Pressure in Pascals
+    double altitude_m;       ///< Calculated altitude in meters
+    double temperature_c;    ///< Temperature in Celsius
+    double climb_rate_ms;    ///< Vertical speed in m/s
+    uint64_t timestamp_us;
+    
+    BarometerData() : pressure_pa(101325), altitude_m(0), 
+                      temperature_c(15), climb_rate_ms(0), timestamp_us(0) {}
+};
+
+/**
+ * @brief Complete sensor state
+ */
+struct SensorState {
+    IMUData imu;
+    BarometerData barometer;
+    GPSPosition gps;
+    Velocity3D velocity;
+    double rangefinder_distance_m;
+    double airspeed_ms;
+    double battery_voltage_v;
+    double battery_current_a;
+    
+    SensorState() : rangefinder_distance_m(-1), airspeed_ms(0), 
+                    battery_voltage_v(0), battery_current_a(0) {}
+};
+
+/**
+ * @brief Control setpoint
+ */
+struct ControlSetpoint {
+    enum Type {
+        RATE,      ///< Angular rate control
+        ATTITUDE,  ///< Attitude angle control
+        VELOCITY,  ///< Velocity control
+        POSITION   ///< Position control
+    } type;
+    
+    // Rate setpoints
+    AngularRates rates;
+    
+    // Attitude setpoints
+    Attitude attitude;
+    double thrust_normalized;  ///< Thrust 0-1
+    
+    // Velocity setpoints
+    Velocity3D velocity;
+    
+    // Position setpoints
+    Position3D position;
+    double yaw_deg;
+    
+    ControlSetpoint() : type(ATTITUDE), thrust_normalized(0), yaw_deg(0) {}
+};
+
+/**
+ * @brief Telemetry data packet
+ */
+struct TelemetryData {
+    uint64_t timestamp_us;
+    
+    // Vehicle state
+    Position3D position;
+    Velocity3D velocity;
+    Attitude attitude;
+    AngularRates rates;
+    
+    // Sensor data
+    SensorState sensors;
+    
+    // Control data
+    ControlSetpoint setpoint;
+    std::array<double, 8> motor_outputs;
+    
+    // System status
+    uint8_t flight_mode;
+    bool armed;
+    bool failsafe_active;
+    uint8_t system_health;
+    
+    // Performance metrics
+    double control_loop_rate_hz;
+    double cpu_usage_percent;
+    uint32_t missed_deadlines;
+    
+    TelemetryData() : timestamp_us(0), motor_outputs{}, flight_mode(0),
+                      armed(false), failsafe_active(false), system_health(100),
+                      control_loop_rate_hz(0), cpu_usage_percent(0), 
+                      missed_deadlines(0) {}
+};
+
+/**
+ * @brief Mission waypoint
+ */
+struct Waypoint {
+    GPSPosition position;
+    double speed_ms;           ///< Desired speed to waypoint
+    double acceptance_radius_m; ///< Waypoint reached when within this radius
+    double loiter_time_s;      ///< Time to loiter at waypoint
+    
+    enum Action {
+        CONTINUE,      ///< Continue to next waypoint
+        LOITER,        ///< Loiter for specified time
+        LAND,          ///< Land at this waypoint
+        RTH            ///< Return to home
+    } action;
+    
+    Waypoint() : speed_ms(5.0), acceptance_radius_m(2.0), 
+                 loiter_time_s(0), action(CONTINUE) {}
+};
+
+/**
+ * @brief Complete mission definition
+ */
+struct Mission {
+    std::vector<Waypoint> waypoints;
+    uint32_t current_waypoint_index;
+    
+    enum CompletionAction {
+        LOITER_LAST,   ///< Loiter at last waypoint
+        RETURN_HOME,   ///< Return to launch point
+        LAND_LAST      ///< Land at last waypoint
+    } completion_action;
+    
+    void addWaypoint(const GPSPosition& pos, double speed_ms = 5.0) {
+        Waypoint wp;
+        wp.position = pos;
+        wp.speed_ms = speed_ms;
+        waypoints.push_back(wp);
+    }
+    
+    void setSpeed(double speed_ms) {
+        for (auto& wp : waypoints) {
+            wp.speed_ms = speed_ms;
+        }
+    }
+    
+    Mission() : current_waypoint_index(0), completion_action(RETURN_HOME) {}
+};
+
+/**
+ * @brief Safety limits configuration
+ */
+struct SafetyLimits {
+    double max_altitude_m{500.0};
+    double max_distance_m{1000.0};
+    double min_battery_voltage{3.3 * 4};  // 4S battery
+    double max_roll_deg{45.0};
+    double max_pitch_deg{45.0};
+    double max_velocity_ms{20.0};
+    double geofence_radius_m{500.0};
+    GPSPosition home_position;
+};
+
+} // namespace rtfcs
+
+#endif // RTFCS_TYPES_HPP

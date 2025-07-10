@@ -1,0 +1,339 @@
+#include "rtfcs/sensors/imu_driver.hpp"
+#include "rtfcs/logger.hpp"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
+#include <cstring>
+#include <thread>
+
+namespace rtfcs {
+
+// ICM-42688-P register definitions
+namespace ICM42688 {
+    // Bank 0 registers
+    constexpr uint8_t REG_DEVICE_CONFIG = 0x11;
+    constexpr uint8_t REG_INT_CONFIG = 0x14;
+    constexpr uint8_t REG_FIFO_CONFIG = 0x16;
+    constexpr uint8_t REG_TEMP_DATA1 = 0x1D;
+    constexpr uint8_t REG_ACCEL_DATA_X1 = 0x1F;
+    constexpr uint8_t REG_GYRO_DATA_X1 = 0x25;
+    constexpr uint8_t REG_INT_STATUS = 0x2D;
+    constexpr uint8_t REG_WHO_AM_I = 0x75;
+    constexpr uint8_t REG_BANK_SEL = 0x76;
+    
+    // Bank 1 registers
+    constexpr uint8_t REG_GYRO_CONFIG0 = 0x4F;
+    constexpr uint8_t REG_ACCEL_CONFIG0 = 0x50;
+    constexpr uint8_t REG_GYRO_CONFIG1 = 0x51;
+    constexpr uint8_t REG_ACCEL_CONFIG1 = 0x53;
+    
+    // Constants
+    constexpr uint8_t WHO_AM_I_VALUE = 0x47;
+    constexpr uint8_t READ_FLAG = 0x80;
+    
+    // Scale factors
+    constexpr double ACCEL_SCALE_2G = 16384.0;   // LSB/g
+    constexpr double ACCEL_SCALE_16G = 2048.0;   // LSB/g
+    constexpr double GYRO_SCALE_250DPS = 131.0;  // LSB/(deg/s)
+    constexpr double GYRO_SCALE_2000DPS = 16.4;  // LSB/(deg/s)
+    constexpr double TEMP_SCALE = 132.48;        // LSB/°C
+    constexpr double TEMP_OFFSET = 25.0;         // °C
+}
+
+class IMUDriver::Impl {
+public:
+    bool initialize(const Config& config);
+    bool readData(IMUData& data);
+    void shutdown();
+    
+private:
+    bool openSPI();
+    bool configureSPI();
+    bool verifyChipID();
+    bool configureIMU();
+    bool setSampleRate(uint32_t rate_hz);
+    
+    uint8_t readRegister(uint8_t reg);
+    void writeRegister(uint8_t reg, uint8_t value);
+    void readRegisters(uint8_t reg, uint8_t* buffer, size_t length);
+    
+    int spi_fd_{-1};
+    Config config_;
+    double accel_scale_{ICM42688::ACCEL_SCALE_16G};
+    double gyro_scale_{ICM42688::GYRO_SCALE_2000DPS};
+};
+
+IMUDriver::IMUDriver() : pImpl_(std::make_unique<Impl>()) {}
+
+IMUDriver::~IMUDriver() = default;
+
+bool IMUDriver::initialize(const Config& config) {
+    return pImpl_->initialize(config);
+}
+
+bool IMUDriver::readData(IMUData& data) {
+    return pImpl_->readData(data);
+}
+
+void IMUDriver::shutdown() {
+    pImpl_->shutdown();
+}
+
+bool IMUDriver::Impl::initialize(const Config& config) {
+    config_ = config;
+    
+    LOG_INFO("Initializing IMU driver (ICM-42688-P)");
+    
+    // Open SPI device
+    if (!openSPI()) {
+        LOG_ERROR("Failed to open SPI device");
+        return false;
+    }
+    
+    // Configure SPI
+    if (!configureSPI()) {
+        LOG_ERROR("Failed to configure SPI");
+        close(spi_fd_);
+        return false;
+    }
+    
+    // Verify chip ID
+    if (!verifyChipID()) {
+        LOG_ERROR("Failed to verify IMU chip ID");
+        close(spi_fd_);
+        return false;
+    }
+    
+    // Configure IMU
+    if (!configureIMU()) {
+        LOG_ERROR("Failed to configure IMU");
+        close(spi_fd_);
+        return false;
+    }
+    
+    // Set sample rate
+    if (!setSampleRate(config.sample_rate_hz)) {
+        LOG_ERROR("Failed to set sample rate");
+        close(spi_fd_);
+        return false;
+    }
+    
+    LOG_INFO("IMU initialized successfully");
+    return true;
+}
+
+bool IMUDriver::Impl::openSPI() {
+    std::string device = "/dev/spidev" + std::to_string(config_.spi_bus) + ".0";
+    
+    spi_fd_ = open(device.c_str(), O_RDWR);
+    if (spi_fd_ < 0) {
+        LOG_ERROR("Failed to open SPI device: " << device);
+        return false;
+    }
+    
+    return true;
+}
+
+bool IMUDriver::Impl::configureSPI() {
+    // Set SPI mode
+    uint8_t mode = SPI_MODE_3;  // CPOL=1, CPHA=1
+    if (ioctl(spi_fd_, SPI_IOC_WR_MODE, &mode) < 0) {
+        LOG_ERROR("Failed to set SPI mode");
+        return false;
+    }
+    
+    // Set bits per word
+    uint8_t bits = 8;
+    if (ioctl(spi_fd_, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) {
+        LOG_ERROR("Failed to set bits per word");
+        return false;
+    }
+    
+    // Set max speed
+    uint32_t speed = 10000000;  // 10 MHz
+    if (ioctl(spi_fd_, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+        LOG_ERROR("Failed to set SPI speed");
+        return false;
+    }
+    
+    return true;
+}
+
+bool IMUDriver::Impl::verifyChipID() {
+    // Wait for chip to be ready
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // Read WHO_AM_I register
+    uint8_t chip_id = readRegister(ICM42688::REG_WHO_AM_I);
+    
+    if (chip_id != ICM42688::WHO_AM_I_VALUE) {
+        LOG_ERROR("Invalid chip ID: 0x" << std::hex << (int)chip_id 
+                  << " (expected 0x" << (int)ICM42688::WHO_AM_I_VALUE << ")");
+        return false;
+    }
+    
+    LOG_INFO("IMU chip ID verified: 0x" << std::hex << (int)chip_id);
+    return true;
+}
+
+bool IMUDriver::Impl::configureIMU() {
+    // Software reset
+    writeRegister(ICM42688::REG_DEVICE_CONFIG, 0x01);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    
+    // Select Bank 1 for configuration
+    writeRegister(ICM42688::REG_BANK_SEL, 0x01);
+    
+    // Configure accelerometer
+    // ±16g range, ODR = 1kHz
+    writeRegister(ICM42688::REG_ACCEL_CONFIG0, 0x06);
+    
+    // Configure gyroscope  
+    // ±2000 dps range, ODR = 1kHz
+    writeRegister(ICM42688::REG_GYRO_CONFIG0, 0x06);
+    
+    // Configure filters
+    // Accelerometer: BW = 180Hz
+    writeRegister(ICM42688::REG_ACCEL_CONFIG1, 0x01);
+    
+    // Gyroscope: BW = 180Hz
+    writeRegister(ICM42688::REG_GYRO_CONFIG1, 0x01);
+    
+    // Return to Bank 0
+    writeRegister(ICM42688::REG_BANK_SEL, 0x00);
+    
+    // Enable sensors
+    writeRegister(ICM42688::REG_DEVICE_CONFIG, 0x0F);  // Enable accel and gyro
+    
+    // Configure interrupt (data ready)
+    writeRegister(ICM42688::REG_INT_CONFIG, 0x18);  // INT1 push-pull, active high
+    
+    return true;
+}
+
+bool IMUDriver::Impl::setSampleRate(uint32_t rate_hz) {
+    // ICM-42688-P supports 1kHz, 500Hz, 200Hz, 100Hz, 50Hz, etc.
+    // For this example, we'll use 1kHz if requested rate >= 1000
+    
+    if (rate_hz >= 1000) {
+        // Already configured for 1kHz
+        LOG_INFO("IMU sample rate set to 1000 Hz");
+    } else {
+        LOG_WARN("Requested sample rate " << rate_hz 
+                 << " Hz not implemented, using 1000 Hz");
+    }
+    
+    return true;
+}
+
+uint8_t IMUDriver::Impl::readRegister(uint8_t reg) {
+    uint8_t tx[2] = {(uint8_t)(reg | ICM42688::READ_FLAG), 0};
+    uint8_t rx[2] = {0, 0};
+    
+    struct spi_ioc_transfer transfer = {};
+    transfer.tx_buf = (unsigned long)tx;
+    transfer.rx_buf = (unsigned long)rx;
+    transfer.len = 2;
+    transfer.speed_hz = 10000000;
+    transfer.bits_per_word = 8;
+    
+    if (ioctl(spi_fd_, SPI_IOC_MESSAGE(1), &transfer) < 0) {
+        LOG_ERROR("SPI read failed");
+        return 0;
+    }
+    
+    return rx[1];
+}
+
+void IMUDriver::Impl::writeRegister(uint8_t reg, uint8_t value) {
+    uint8_t tx[2] = {reg, value};
+    
+    struct spi_ioc_transfer transfer = {};
+    transfer.tx_buf = (unsigned long)tx;
+    transfer.len = 2;
+    transfer.speed_hz = 10000000;
+    transfer.bits_per_word = 8;
+    
+    if (ioctl(spi_fd_, SPI_IOC_MESSAGE(1), &transfer) < 0) {
+        LOG_ERROR("SPI write failed");
+    }
+}
+
+void IMUDriver::Impl::readRegisters(uint8_t reg, uint8_t* buffer, size_t length) {
+    uint8_t tx[length + 1];
+    uint8_t rx[length + 1];
+    
+    tx[0] = reg | ICM42688::READ_FLAG;
+    memset(&tx[1], 0, length);
+    
+    struct spi_ioc_transfer transfer = {};
+    transfer.tx_buf = (unsigned long)tx;
+    transfer.rx_buf = (unsigned long)rx;
+    transfer.len = length + 1;
+    transfer.speed_hz = 10000000;
+    transfer.bits_per_word = 8;
+    
+    if (ioctl(spi_fd_, SPI_IOC_MESSAGE(1), &transfer) < 0) {
+        LOG_ERROR("SPI burst read failed");
+        return;
+    }
+    
+    memcpy(buffer, &rx[1], length);
+}
+
+bool IMUDriver::Impl::readData(IMUData& data) {
+    // Check data ready
+    uint8_t status = readRegister(ICM42688::REG_INT_STATUS);
+    if (!(status & 0x08)) {  // Data not ready
+        return false;
+    }
+    
+    // Read all sensor data in one burst (14 bytes)
+    uint8_t raw_data[14];
+    readRegisters(ICM42688::REG_TEMP_DATA1, raw_data, 14);
+    
+    // Parse temperature (bytes 0-1)
+    int16_t temp_raw = (int16_t)((raw_data[0] << 8) | raw_data[1]);
+    data.temperature_c = (temp_raw / ICM42688::TEMP_SCALE) + ICM42688::TEMP_OFFSET;
+    
+    // Parse accelerometer data (bytes 2-7)
+    int16_t accel_x = (int16_t)((raw_data[2] << 8) | raw_data[3]);
+    int16_t accel_y = (int16_t)((raw_data[4] << 8) | raw_data[5]);
+    int16_t accel_z = (int16_t)((raw_data[6] << 8) | raw_data[7]);
+    
+    // Convert to m/s² and apply calibration
+    data.accelerometer[0] = (accel_x / accel_scale_) * 9.81 - config_.accel_offset[0];
+    data.accelerometer[1] = (accel_y / accel_scale_) * 9.81 - config_.accel_offset[1];
+    data.accelerometer[2] = (accel_z / accel_scale_) * 9.81 - config_.accel_offset[2];
+    
+    // Parse gyroscope data (bytes 8-13)
+    int16_t gyro_x = (int16_t)((raw_data[8] << 8) | raw_data[9]);
+    int16_t gyro_y = (int16_t)((raw_data[10] << 8) | raw_data[11]);
+    int16_t gyro_z = (int16_t)((raw_data[12] << 8) | raw_data[13]);
+    
+    // Convert to rad/s and apply calibration
+    data.gyroscope[0] = ((gyro_x / gyro_scale_) * M_PI / 180.0) - config_.gyro_offset[0];
+    data.gyroscope[1] = ((gyro_y / gyro_scale_) * M_PI / 180.0) - config_.gyro_offset[1];
+    data.gyroscope[2] = ((gyro_z / gyro_scale_) * M_PI / 180.0) - config_.gyro_offset[2];
+    
+    // Set timestamp
+    data.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    
+    return true;
+}
+
+void IMUDriver::Impl::shutdown() {
+    if (spi_fd_ >= 0) {
+        // Put IMU to sleep
+        writeRegister(ICM42688::REG_DEVICE_CONFIG, 0x00);
+        
+        close(spi_fd_);
+        spi_fd_ = -1;
+    }
+    
+    LOG_INFO("IMU driver shutdown");
+}
+
+} // namespace rtfcs

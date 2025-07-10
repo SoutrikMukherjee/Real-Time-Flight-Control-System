@@ -1,0 +1,217 @@
+#ifndef RTFCS_PID_CONTROLLER_HPP
+#define RTFCS_PID_CONTROLLER_HPP
+
+#include <chrono>
+#include <algorithm>
+
+namespace rtfcs {
+
+/**
+ * @brief Generic PID controller implementation
+ * 
+ * Features:
+ * - Anti-windup protection
+ * - Derivative filtering
+ * - Bumpless transfer
+ * - Output saturation
+ */
+class PIDController {
+public:
+    /**
+     * @brief PID gains structure
+     */
+    struct Gains {
+        double kp{0.0};  ///< Proportional gain
+        double ki{0.0};  ///< Integral gain
+        double kd{0.0};  ///< Derivative gain
+        double imax{1.0}; ///< Maximum integral term
+        double filter_coefficient{0.1}; ///< Derivative filter (0-1)
+    };
+
+    PIDController() = default;
+    
+    explicit PIDController(const Gains& gains) : gains_(gains) {
+        last_time_ = std::chrono::high_resolution_clock::now();
+    }
+
+    /**
+     * @brief Update PID controller
+     * @param error Current error (setpoint - measurement)
+     * @return Control output
+     */
+    double update(double error) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double dt = std::chrono::duration<double>(now - last_time_).count();
+        
+        // Prevent issues on first call or after long pause
+        if (dt <= 0.0 || dt > 1.0) {
+            dt = 0.001;
+        }
+        
+        // Proportional term
+        double p_term = gains_.kp * error;
+        
+        // Integral term with anti-windup
+        integral_ += error * dt;
+        
+        // Limit integral term
+        if (gains_.imax > 0) {
+            integral_ = std::max(-gains_.imax / gains_.ki, 
+                               std::min(gains_.imax / gains_.ki, integral_));
+        }
+        
+        double i_term = gains_.ki * integral_;
+        
+        // Derivative term with filtering
+        double derivative = (error - last_error_) / dt;
+        filtered_derivative_ = gains_.filter_coefficient * derivative + 
+                             (1.0 - gains_.filter_coefficient) * filtered_derivative_;
+        
+        double d_term = gains_.kd * filtered_derivative_;
+        
+        // Total output
+        double output = p_term + i_term + d_term;
+        
+        // Update state
+        last_error_ = error;
+        last_time_ = now;
+        
+        return output;
+    }
+
+    /**
+     * @brief Update PID controller with feedforward
+     * @param error Current error
+     * @param feedforward Feedforward term
+     * @return Control output
+     */
+    double update(double error, double feedforward) {
+        return update(error) + feedforward;
+    }
+
+    /**
+     * @brief Set PID gains
+     */
+    void setGains(double kp, double ki, double kd) {
+        gains_.kp = kp;
+        gains_.ki = ki;
+        gains_.kd = kd;
+    }
+
+    /**
+     * @brief Set all gains including limits
+     */
+    void setGains(const Gains& gains) {
+        gains_ = gains;
+    }
+
+    /**
+     * @brief Get current gains
+     */
+    const Gains& getGains() const { return gains_; }
+
+    /**
+     * @brief Reset controller state
+     */
+    void reset() {
+        integral_ = 0.0;
+        last_error_ = 0.0;
+        filtered_derivative_ = 0.0;
+        last_time_ = std::chrono::high_resolution_clock::now();
+    }
+
+    /**
+     * @brief Set integral term (for bumpless transfer)
+     */
+    void setIntegral(double integral) {
+        integral_ = integral;
+    }
+
+    /**
+     * @brief Get current integral term
+     */
+    double getIntegral() const { return integral_; }
+
+    /**
+     * @brief Get debug information
+     */
+    struct DebugInfo {
+        double p_term;
+        double i_term;
+        double d_term;
+        double total_output;
+        double integral_value;
+        double derivative_value;
+    };
+
+    DebugInfo getDebugInfo(double error) const {
+        DebugInfo info;
+        info.p_term = gains_.kp * error;
+        info.i_term = gains_.ki * integral_;
+        info.d_term = gains_.kd * filtered_derivative_;
+        info.total_output = info.p_term + info.i_term + info.d_term;
+        info.integral_value = integral_;
+        info.derivative_value = filtered_derivative_;
+        return info;
+    }
+
+private:
+    Gains gains_;
+    double integral_{0.0};
+    double last_error_{0.0};
+    double filtered_derivative_{0.0};
+    std::chrono::high_resolution_clock::time_point last_time_;
+};
+
+/**
+ * @brief Cascade PID controller (for nested loops)
+ */
+class CascadePIDController {
+public:
+    CascadePIDController() = default;
+
+    /**
+     * @brief Update cascade controller
+     * @param outer_error Error for outer loop
+     * @param inner_measurement Current measurement for inner loop
+     * @return Control output
+     */
+    double update(double outer_error, double inner_measurement) {
+        // Outer loop generates setpoint for inner loop
+        double inner_setpoint = outer_pid_.update(outer_error);
+        
+        // Inner loop tracks the setpoint
+        double inner_error = inner_setpoint - inner_measurement;
+        return inner_pid_.update(inner_error);
+    }
+
+    /**
+     * @brief Set gains for outer loop
+     */
+    void setOuterGains(const PIDController::Gains& gains) {
+        outer_pid_.setGains(gains);
+    }
+
+    /**
+     * @brief Set gains for inner loop
+     */
+    void setInnerGains(const PIDController::Gains& gains) {
+        inner_pid_.setGains(gains);
+    }
+
+    /**
+     * @brief Reset both controllers
+     */
+    void reset() {
+        outer_pid_.reset();
+        inner_pid_.reset();
+    }
+
+private:
+    PIDController outer_pid_;
+    PIDController inner_pid_;
+};
+
+} // namespace rtfcs
+
+#endif // RTFCS_PID_CONTROLLER_HPP

@@ -1,0 +1,544 @@
+#include "rtfcs/flight_controller.hpp"
+#include "rtfcs/logger.hpp"
+#include "rtfcs/config_parser.hpp"
+#include "rtfcs/hardware_interface.hpp"
+
+#include <iostream>
+#include <fstream>
+#include <sched.h>
+#include <sys/mman.h>
+
+namespace rtfcs {
+
+FlightController::FlightController() 
+    : status_{}, 
+      last_control_time_(std::chrono::high_resolution_clock::now()),
+      start_time_(std::chrono::high_resolution_clock::now()) {
+    
+    // Initialize status
+    status_.mode = FlightMode::MANUAL;
+    status_.armed = false;
+    status_.flying = false;
+    status_.altitude_m = 0.0;
+    status_.groundspeed_ms = 0.0;
+    status_.battery_voltage = 0.0;
+    status_.flight_time_ms = 0;
+    status_.gps_satellites = 0;
+    status_.system_health = 100;
+}
+
+FlightController::~FlightController() {
+    stop();
+}
+
+bool FlightController::initialize(const std::string& config_path) {
+    LOG_INFO("Initializing flight controller with config: " << config_path);
+    
+    // Lock memory to prevent page faults in real-time sections
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        LOG_ERROR("Failed to lock memory: " << strerror(errno));
+        return false;
+    }
+    
+    // Parse configuration
+    ConfigParser parser;
+    if (!parser.loadFile(config_path)) {
+        LOG_ERROR("Failed to load configuration file");
+        return false;
+    }
+    
+    // Load configuration parameters
+    config_.enable_redundancy = parser.getBool("safety.enable_redundancy", true);
+    config_.enable_logging = parser.getBool("system.enable_logging", true);
+    config_.imu_sample_rate_hz = parser.getInt("sensors.imu_rate_hz", 1000);
+    config_.gps_sample_rate_hz = parser.getInt("sensors.gps_rate_hz", 25);
+    config_.vehicle_type = parser.getString("vehicle.type", "quadcopter");
+    config_.max_roll_deg = parser.getDouble("limits.max_roll_deg", 45.0);
+    config_.max_pitch_deg = parser.getDouble("limits.max_pitch_deg", 45.0);
+    config_.max_yaw_rate_dps = parser.getDouble("limits.max_yaw_rate_dps", 180.0);
+    config_.max_climb_rate_ms = parser.getDouble("limits.max_climb_rate_ms", 10.0);
+    config_.max_velocity_ms = parser.getDouble("limits.max_velocity_ms", 20.0);
+    
+    // Initialize subsystems
+    try {
+        sensor_fusion_ = std::make_unique<SensorFusion>();
+        if (!sensor_fusion_->initialize()) {
+            LOG_ERROR("Failed to initialize sensor fusion");
+            return false;
+        }
+        
+        attitude_controller_ = std::make_unique<AttitudeController>();
+        attitude_controller_->setLimits(config_.max_roll_deg, 
+                                       config_.max_pitch_deg, 
+                                       config_.max_yaw_rate_dps);
+        
+        position_controller_ = std::make_unique<PositionController>();
+        position_controller_->setLimits(config_.max_velocity_ms, 
+                                       config_.max_climb_rate_ms);
+        
+        safety_monitor_ = std::make_unique<SafetyMonitor>();
+        safety_monitor_->enableRedundancy(config_.enable_redundancy);
+        
+        mission_planner_ = std::make_unique<MissionPlanner>();
+        telemetry_ = std::make_unique<Telemetry>();
+        
+        // Initialize hardware interfaces
+        if (!HardwareInterface::getInstance().initialize()) {
+            LOG_ERROR("Failed to initialize hardware interfaces");
+            return false;
+        }
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception during initialization: " << e.what());
+        return false;
+    }
+    
+    LOG_INFO("Flight controller initialized successfully");
+    return true;
+}
+
+bool FlightController::start() {
+    if (running_) {
+        LOG_WARN("Flight controller already running");
+        return false;
+    }
+    
+    LOG_INFO("Starting flight controller");
+    running_ = true;
+    
+    // Start control threads with real-time priorities
+    control_thread_ = std::thread(&FlightController::controlLoop, this);
+    navigation_thread_ = std::thread(&FlightController::navigationLoop, this);
+    telemetry_thread_ = std::thread(&FlightController::telemetryLoop, this);
+    
+    // Set thread priorities
+    struct sched_param param;
+    param.sched_priority = 90;  // High priority for control loop
+    if (pthread_setschedparam(control_thread_.native_handle(), 
+                             SCHED_FIFO, &param) != 0) {
+        LOG_WARN("Failed to set real-time priority for control thread");
+    }
+    
+    param.sched_priority = 70;  // Medium priority for navigation
+    pthread_setschedparam(navigation_thread_.native_handle(), 
+                         SCHED_FIFO, &param);
+    
+    param.sched_priority = 50;  // Lower priority for telemetry
+    pthread_setschedparam(telemetry_thread_.native_handle(), 
+                         SCHED_FIFO, &param);
+    
+    LOG_INFO("Flight controller started");
+    return true;
+}
+
+void FlightController::stop() {
+    if (!running_) {
+        return;
+    }
+    
+    LOG_INFO("Stopping flight controller");
+    
+    // Signal threads to stop
+    running_ = false;
+    
+    // Wait for threads to finish
+    if (control_thread_.joinable()) {
+        control_thread_.join();
+    }
+    if (navigation_thread_.joinable()) {
+        navigation_thread_.join();
+    }
+    if (telemetry_thread_.joinable()) {
+        telemetry_thread_.join();
+    }
+    
+    // Ensure motors are stopped
+    emergencyStop();
+    
+    LOG_INFO("Flight controller stopped");
+}
+
+bool FlightController::arm() {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    
+    // Pre-arm checks
+    if (!checkSystemHealth()) {
+        LOG_ERROR("System health check failed");
+        return false;
+    }
+    
+    if (status_.gps_satellites < 6) {
+        LOG_ERROR("Insufficient GPS satellites: " << status_.gps_satellites);
+        return false;
+    }
+    
+    if (status_.battery_voltage < 14.0) {  // Assuming 4S battery
+        LOG_ERROR("Battery voltage too low: " << status_.battery_voltage);
+        return false;
+    }
+    
+    // Perform sensor calibration check
+    if (!sensor_fusion_->isCalibrated()) {
+        LOG_ERROR("Sensors not calibrated");
+        return false;
+    }
+    
+    armed_ = true;
+    status_.armed = true;
+    safety_monitor_->setArmedState(true);
+    
+    LOG_INFO("Vehicle armed");
+    return true;
+}
+
+void FlightController::disarm() {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    
+    if (status_.flying) {
+        LOG_WARN("Cannot disarm while flying");
+        return;
+    }
+    
+    armed_ = false;
+    status_.armed = false;
+    safety_monitor_->setArmedState(false);
+    
+    // Stop all motors
+    std::fill(motor_outputs_.begin(), motor_outputs_.end(), 0.0);
+    updateActuators();
+    
+    LOG_INFO("Vehicle disarmed");
+}
+
+bool FlightController::setFlightMode(FlightMode mode) {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    
+    // Validate mode transition
+    if (!safety_monitor_->isModeTransitionSafe(
+            static_cast<uint8_t>(status_.mode), 
+            static_cast<uint8_t>(mode))) {
+        LOG_WARN("Unsafe mode transition rejected");
+        return false;
+    }
+    
+    status_.mode = mode;
+    
+    // Configure controllers for new mode
+    switch (mode) {
+        case FlightMode::MANUAL:
+            attitude_controller_->setMode(AttitudeController::Mode::RATE);
+            break;
+        case FlightMode::STABILIZE:
+            attitude_controller_->setMode(AttitudeController::Mode::ANGLE);
+            break;
+        case FlightMode::ALTITUDE_HOLD:
+        case FlightMode::POSITION_HOLD:
+            attitude_controller_->setMode(AttitudeController::Mode::ANGLE);
+            position_controller_->enable(true);
+            break;
+        case FlightMode::AUTONOMOUS:
+            attitude_controller_->setMode(AttitudeController::Mode::ANGLE);
+            position_controller_->enable(true);
+            mission_planner_->activate();
+            break;
+        case FlightMode::RETURN_TO_HOME:
+            // Set home as target
+            mission_planner_->returnToHome();
+            break;
+        case FlightMode::EMERGENCY_LAND:
+            // Initiate emergency landing
+            position_controller_->setEmergencyDescent(2.0);  // 2 m/s descent
+            break;
+    }
+    
+    LOG_INFO("Flight mode changed to: " << static_cast<int>(mode));
+    return true;
+}
+
+bool FlightController::executeMission(const Mission& mission) {
+    if (status_.mode != FlightMode::AUTONOMOUS) {
+        if (!setFlightMode(FlightMode::AUTONOMOUS)) {
+            return false;
+        }
+    }
+    
+    return mission_planner_->loadMission(mission);
+}
+
+FlightController::Status FlightController::getStatus() const {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return status_;
+}
+
+void FlightController::emergencyStop() {
+    LOG_ERROR("EMERGENCY STOP ACTIVATED");
+    
+    armed_ = false;
+    std::fill(motor_outputs_.begin(), motor_outputs_.end(), 0.0);
+    updateActuators();
+    
+    safety_monitor_->triggerEmergencyStop();
+}
+
+void FlightController::setTelemetryCallback(
+    std::function<void(const TelemetryData&)> callback) {
+    telemetry_->setCallback(callback);
+}
+
+void FlightController::controlLoop() {
+    auto next_time = std::chrono::high_resolution_clock::now();
+    uint64_t cycle_count = 0;
+    
+    while (running_) {
+        auto cycle_start = std::chrono::high_resolution_clock::now();
+        
+        // Update sensors
+        updateSensors();
+        
+        // Run sensor fusion
+        sensor_fusion_->update();
+        
+        // Check system health
+        if (!checkSystemHealth()) {
+            handleFailsafe();
+        }
+        
+        // Run control algorithms if armed
+        if (armed_) {
+            runAttitudeControl();
+            
+            if (status_.mode >= FlightMode::ALTITUDE_HOLD) {
+                runPositionControl();
+            }
+            
+            updateActuators();
+        }
+        
+        // Update performance metrics
+        auto cycle_end = std::chrono::high_resolution_clock::now();
+        auto execution_time = std::chrono::duration_cast<std::chrono::microseconds>(
+            cycle_end - cycle_start).count();
+        
+        perf_metrics_.control_cycles++;
+        perf_metrics_.avg_execution_time_us = 
+            (perf_metrics_.avg_execution_time_us * 0.99) + (execution_time * 0.01);
+        perf_metrics_.max_execution_time_us = 
+            std::max(perf_metrics_.max_execution_time_us, static_cast<double>(execution_time));
+        
+        // Wait for next cycle
+        next_time += CONTROL_PERIOD;
+        auto sleep_time = next_time - std::chrono::high_resolution_clock::now();
+        
+        if (sleep_time.count() > 0) {
+            std::this_thread::sleep_until(next_time);
+        } else {
+            // Missed deadline
+            perf_metrics_.missed_deadlines++;
+            LOG_WARN("Control loop missed deadline by " 
+                    << -sleep_time.count() / 1000 << " us");
+            next_time = std::chrono::high_resolution_clock::now();
+        }
+        
+        cycle_count++;
+    }
+}
+
+void FlightController::navigationLoop() {
+    auto next_time = std::chrono::high_resolution_clock::now();
+    
+    while (running_) {
+        auto cycle_start = std::chrono::high_resolution_clock::now();
+        
+        // Get current state from sensor fusion
+        auto state = sensor_fusion_->getState();
+        
+        // Update status
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.position = state.position;
+            status_.altitude_m = -state.position.down_m;
+            status_.groundspeed_ms = std::sqrt(
+                state.velocity.north_ms * state.velocity.north_ms +
+                state.velocity.east_ms * state.velocity.east_ms);
+            status_.attitude = state.attitude;
+            status_.gps_satellites = state.gps_satellites;
+            status_.battery_voltage = state.battery_voltage;
+            status_.flight_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                cycle_start - start_time_).count();
+        }
+        
+        // Update mission planner if in autonomous mode
+        if (status_.mode == FlightMode::AUTONOMOUS) {
+            mission_planner_->update(state);
+            
+            // Get navigation commands
+            auto nav_cmd = mission_planner_->getCommand();
+            position_controller_->setTarget(nav_cmd);
+        }
+        
+        // Wait for next cycle
+        next_time += NAV_PERIOD;
+        std::this_thread::sleep_until(next_time);
+    }
+}
+
+void FlightController::telemetryLoop() {
+    auto next_time = std::chrono::high_resolution_clock::now();
+    
+    while (running_) {
+        // Prepare telemetry data
+        TelemetryData telem;
+        
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            telem.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+            telem.position = status_.position;
+            telem.attitude = status_.attitude;
+            telem.flight_mode = static_cast<uint8_t>(status_.mode);
+            telem.armed = status_.armed;
+            telem.system_health = status_.system_health;
+            telem.motor_outputs = motor_outputs_;
+        }
+        
+        // Add performance metrics
+        telem.control_loop_rate_hz = 1000000.0 / perf_metrics_.avg_execution_time_us;
+        telem.cpu_usage_percent = perf_metrics_.cpu_usage_percent;
+        telem.missed_deadlines = perf_metrics_.missed_deadlines;
+        
+        // Send telemetry
+        telemetry_->send(telem);
+        
+        // Wait for next cycle
+        next_time += TELEMETRY_PERIOD;
+        std::this_thread::sleep_until(next_time);
+    }
+}
+
+void FlightController::updateSensors() {
+    // Read all sensor data
+    auto& hw = HardwareInterface::getInstance();
+    
+    IMUData imu_data = hw.readIMU();
+    BarometerData baro_data = hw.readBarometer();
+    GPSPosition gps_data = hw.readGPS();
+    
+    // Feed to sensor fusion
+    sensor_fusion_->addIMUData(imu_data);
+    sensor_fusion_->addBarometerData(baro_data);
+    sensor_fusion_->addGPSData(gps_data);
+    
+    // Update battery monitoring
+    status_.battery_voltage = hw.readBatteryVoltage();
+}
+
+void FlightController::runAttitudeControl() {
+    auto state = sensor_fusion_->getState();
+    
+    // Get control setpoint based on mode
+    ControlSetpoint setpoint;
+    
+    if (status_.mode == FlightMode::MANUAL) {
+        // Get pilot input
+        auto pilot_input = HardwareInterface::getInstance().getPilotInput();
+        setpoint.type = ControlSetpoint::RATE;
+        setpoint.rates.roll_rate_rads = pilot_input.roll * config_.max_roll_deg * M_PI / 180.0;
+        setpoint.rates.pitch_rate_rads = pilot_input.pitch * config_.max_pitch_deg * M_PI / 180.0;
+        setpoint.rates.yaw_rate_rads = pilot_input.yaw * config_.max_yaw_rate_dps * M_PI / 180.0;
+        setpoint.thrust_normalized = pilot_input.thrust;
+    } else {
+        // Get setpoint from position controller or pilot
+        setpoint = position_controller_->getAttitudeSetpoint();
+    }
+    
+    // Run attitude controller
+    auto control_output = attitude_controller_->update(state, setpoint);
+    
+    // Mix controls to motor outputs
+    mixControlsToMotors(control_output);
+}
+
+void FlightController::runPositionControl() {
+    auto state = sensor_fusion_->getState();
+    position_controller_->update(state);
+}
+
+void FlightController::updateActuators() {
+    if (!armed_) {
+        std::fill(motor_outputs_.begin(), motor_outputs_.end(), 0.0);
+    }
+    
+    // Apply safety limits
+    safety_monitor_->limitOutputs(motor_outputs_);
+    
+    // Send to hardware
+    HardwareInterface::getInstance().setMotorOutputs(motor_outputs_);
+}
+
+bool FlightController::checkSystemHealth() {
+    uint8_t health_score = 100;
+    
+    // Check sensor health
+    if (!sensor_fusion_->isHealthy()) {
+        health_score -= 30;
+    }
+    
+    // Check control performance
+    if (perf_metrics_.missed_deadlines > 10) {
+        health_score -= 20;
+    }
+    
+    // Check battery
+    if (status_.battery_voltage < 14.5 && status_.battery_voltage > 0) {
+        health_score -= 10;
+    }
+    
+    // Check GPS
+    if (status_.gps_satellites < 8) {
+        health_score -= 10;
+    }
+    
+    status_.system_health = health_score;
+    return health_score >= 50;  // Minimum acceptable health
+}
+
+void FlightController::handleFailsafe() {
+    LOG_ERROR("Failsafe triggered - system health: " << status_.system_health);
+    
+    if (status_.altitude_m > 10.0) {
+        // If flying, initiate emergency landing
+        setFlightMode(FlightMode::EMERGENCY_LAND);
+    } else {
+        // If on ground, disarm
+        disarm();
+    }
+    
+    safety_monitor_->triggerFailsafe();
+}
+
+void FlightController::mixControlsToMotors(const ControlOutput& control) {
+    // Quadcopter mixing
+    // Motor layout:
+    //   1   2
+    //    \ /
+    //     X
+    //    / \
+    //   4   3
+    
+    double roll = control.roll;
+    double pitch = control.pitch;
+    double yaw = control.yaw;
+    double thrust = control.thrust;
+    
+    motor_outputs_[0] = thrust + pitch + roll - yaw;  // Front left
+    motor_outputs_[1] = thrust + pitch - roll + yaw;  // Front right
+    motor_outputs_[2] = thrust - pitch - roll - yaw;  // Rear right
+    motor_outputs_[3] = thrust - pitch + roll + yaw;  // Rear left
+    
+    // Normalize outputs to 0-1 range
+    for (auto& output : motor_outputs_) {
+        output = std::max(0.0, std::min(1.0, output));
+    }
+}
+
+} // namespace rtfcs

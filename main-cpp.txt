@@ -1,0 +1,225 @@
+#include <iostream>
+#include <csignal>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <boost/program_options.hpp>
+
+#include "rtfcs/flight_controller.hpp"
+#include "rtfcs/logger.hpp"
+#include "rtfcs/version.hpp"
+
+namespace po = boost::program_options;
+using namespace rtfcs;
+
+// Global flag for signal handling
+std::atomic<bool> g_shutdown_requested(false);
+
+// Signal handler
+void signalHandler(int signal) {
+    if (signal == SIGINT || signal == SIGTERM) {
+        LOG_INFO("Shutdown signal received");
+        g_shutdown_requested = true;
+    }
+}
+
+// Print usage information
+void printUsage(const po::options_description& desc) {
+    std::cout << "Real-Time Flight Control System (RTFCS) v" 
+              << RTFCS_VERSION_MAJOR << "." 
+              << RTFCS_VERSION_MINOR << "."
+              << RTFCS_VERSION_PATCH << "\n\n";
+    std::cout << "Usage: rtfcs_flight_controller [options]\n\n";
+    std::cout << desc << std::endl;
+}
+
+// Print system status
+void printStatus(const FlightController::Status& status) {
+    std::cout << "\r[RTFCS] "
+              << "Mode: " << static_cast<int>(status.mode) << " | "
+              << "Armed: " << (status.armed ? "YES" : "NO") << " | "
+              << "Alt: " << std::fixed << std::setprecision(1) << status.altitude_m << "m | "
+              << "Spd: " << status.groundspeed_ms << "m/s | "
+              << "GPS: " << static_cast<int>(status.gps_satellites) << " | "
+              << "Bat: " << status.battery_voltage << "V | "
+              << "Health: " << static_cast<int>(status.system_health) << "%"
+              << std::flush;
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        // Parse command line options
+        po::options_description desc("Options");
+        desc.add_options()
+            ("help,h", "Show help message")
+            ("config,c", po::value<std::string>()->default_value("/etc/rtfcs/config.yaml"), 
+             "Configuration file path")
+            ("log-level,l", po::value<std::string>()->default_value("INFO"), 
+             "Log level (DEBUG, INFO, WARN, ERROR)")
+            ("daemon,d", "Run as daemon")
+            ("status-rate,s", po::value<int>()->default_value(2), 
+             "Status display rate in Hz")
+            ("mission,m", po::value<std::string>(), 
+             "Mission file to execute on startup")
+            ("hardware-test", "Run hardware test and exit")
+            ("version,v", "Show version information");
+        
+        po::variables_map vm;
+        po::store(po::parse_command_line(argc, argv, desc), vm);
+        po::notify(vm);
+        
+        // Handle help
+        if (vm.count("help")) {
+            printUsage(desc);
+            return 0;
+        }
+        
+        // Handle version
+        if (vm.count("version")) {
+            std::cout << "RTFCS version " 
+                      << RTFCS_VERSION_MAJOR << "." 
+                      << RTFCS_VERSION_MINOR << "."
+                      << RTFCS_VERSION_PATCH << "\n";
+            std::cout << "Build date: " << __DATE__ << " " << __TIME__ << "\n";
+            std::cout << "Copyright (c) 2025 RTFCS Team\n";
+            return 0;
+        }
+        
+        // Initialize logger
+        std::string log_level = vm["log-level"].as<std::string>();
+        Logger::getInstance().setLevel(Logger::stringToLevel(log_level));
+        
+        LOG_INFO("===========================================");
+        LOG_INFO("Real-Time Flight Control System v" 
+                 << RTFCS_VERSION_MAJOR << "." 
+                 << RTFCS_VERSION_MINOR << "."
+                 << RTFCS_VERSION_PATCH);
+        LOG_INFO("===========================================");
+        
+        // Hardware test mode
+        if (vm.count("hardware-test")) {
+            LOG_INFO("Running hardware test...");
+            // TODO: Implement hardware test
+            LOG_INFO("Hardware test completed");
+            return 0;
+        }
+        
+        // Setup signal handlers
+        std::signal(SIGINT, signalHandler);
+        std::signal(SIGTERM, signalHandler);
+        
+        // Create and initialize flight controller
+        FlightController fc;
+        std::string config_file = vm["config"].as<std::string>();
+        
+        LOG_INFO("Loading configuration from: " << config_file);
+        if (!fc.initialize(config_file)) {
+            LOG_ERROR("Failed to initialize flight controller");
+            return 1;
+        }
+        
+        // Start the flight controller
+        if (!fc.start()) {
+            LOG_ERROR("Failed to start flight controller");
+            return 1;
+        }
+        
+        LOG_INFO("Flight controller started successfully");
+        
+        // Load mission if specified
+        if (vm.count("mission")) {
+            std::string mission_file = vm["mission"].as<std::string>();
+            LOG_INFO("Loading mission from: " << mission_file);
+            // TODO: Implement mission loading
+        }
+        
+        // Daemon mode
+        if (vm.count("daemon")) {
+            LOG_INFO("Running in daemon mode");
+            
+            // Fork and detach
+            pid_t pid = fork();
+            if (pid < 0) {
+                LOG_ERROR("Failed to fork daemon");
+                return 1;
+            }
+            if (pid > 0) {
+                // Parent process
+                return 0;
+            }
+            
+            // Child process continues as daemon
+            setsid();
+            
+            // Close standard file descriptors
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
+        }
+        
+        // Main loop
+        int status_rate = vm["status-rate"].as<int>();
+        auto status_period = std::chrono::milliseconds(1000 / status_rate);
+        auto next_status_time = std::chrono::steady_clock::now();
+        
+        LOG_INFO("Entering main loop (Ctrl+C to exit)");
+        
+        while (!g_shutdown_requested) {
+            // Print status if not in daemon mode
+            if (!vm.count("daemon")) {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= next_status_time) {
+                    printStatus(fc.getStatus());
+                    next_status_time += status_period;
+                }
+            }
+            
+            // Check for user commands (if interactive)
+            // TODO: Implement command interface
+            
+            // Sleep briefly to prevent CPU spinning
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        
+        // Shutdown sequence
+        LOG_INFO("\nShutdown requested");
+        
+        // Ensure vehicle is safe
+        if (fc.getStatus().armed) {
+            LOG_WARN("Vehicle is armed - initiating safe shutdown");
+            
+            if (fc.getStatus().flying) {
+                LOG_INFO("Vehicle is flying - switching to emergency land mode");
+                fc.setFlightMode(FlightController::FlightMode::EMERGENCY_LAND);
+                
+                // Wait for landing
+                while (fc.getStatus().altitude_m > 0.5) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+            
+            fc.disarm();
+        }
+        
+        // Stop flight controller
+        fc.stop();
+        
+        LOG_INFO("Flight controller stopped");
+        LOG_INFO("Shutdown complete");
+        
+        return 0;
+        
+    } catch (const po::error& e) {
+        std::cerr << "Command line error: " << e.what() << "\n";
+        std::cerr << "Use --help for usage information\n";
+        return 1;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Fatal error: " << e.what());
+        std::cerr << "Fatal error: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        LOG_ERROR("Unknown fatal error");
+        std::cerr << "Unknown fatal error\n";
+        return 1;
+    }
+}

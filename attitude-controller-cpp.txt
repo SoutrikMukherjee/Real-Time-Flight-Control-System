@@ -1,0 +1,264 @@
+#include "rtfcs/attitude_controller.hpp"
+#include "rtfcs/logger.hpp"
+#include <cmath>
+#include <algorithm>
+
+namespace rtfcs {
+
+AttitudeController::AttitudeController() {
+    // Initialize PID controllers with default gains
+    for (int i = 0; i < 3; i++) {
+        rate_controllers_[i] = std::make_unique<PIDController>();
+    }
+    for (int i = 0; i < 2; i++) {
+        angle_controllers_[i] = std::make_unique<PIDController>();
+    }
+    
+    last_update_time_ = std::chrono::high_resolution_clock::now();
+}
+
+AttitudeController::~AttitudeController() = default;
+
+void AttitudeController::initialize() {
+    LOG_INFO("Initializing attitude controller");
+    
+    // Set default rate controller gains (inner loop)
+    // These values are typical for a 2.5kg quadcopter
+    setRateGains(0, 0.15, 0.1, 0.004);   // Roll rate
+    setRateGains(1, 0.15, 0.1, 0.004);   // Pitch rate
+    setRateGains(2, 0.3, 0.05, 0.0);     // Yaw rate
+    
+    // Set default angle controller gains (outer loop)
+    setAngleGains(0, 6.0, 0.0, 0.0);     // Roll angle
+    setAngleGains(1, 6.0, 0.0, 0.0);     // Pitch angle
+    
+    // Reset all controllers
+    reset();
+    
+    LOG_INFO("Attitude controller initialized");
+}
+
+ControlOutput AttitudeController::update(const SensorState& state, 
+                                       const ControlSetpoint& setpoint) {
+    auto now = std::chrono::high_resolution_clock::now();
+    double dt = std::chrono::duration<double>(now - last_update_time_).count();
+    last_update_time_ = now;
+    
+    // Prevent large dt on first call or after pause
+    if (dt > 0.1) dt = 0.001;
+    
+    ControlOutput output;
+    output.thrust = setpoint.thrust_normalized;
+    
+    // Get current attitude and rates from sensor fusion
+    Attitude current_attitude;
+    current_attitude.roll_rad = state.imu.gyroscope[0];  // This would come from fusion
+    current_attitude.pitch_rad = state.imu.gyroscope[1];
+    current_attitude.yaw_rad = state.imu.gyroscope[2];
+    
+    AngularRates current_rates;
+    current_rates.roll_rate_rads = state.imu.gyroscope[0];
+    current_rates.pitch_rate_rads = state.imu.gyroscope[1];
+    current_rates.yaw_rate_rads = state.imu.gyroscope[2];
+    
+    // Apply low-pass filter to rates for derivative calculation
+    for (int i = 0; i < 3; i++) {
+        double raw_rate = state.imu.gyroscope[i];
+        rate_filters_[i] = filter_alpha_ * raw_rate + 
+                          (1.0 - filter_alpha_) * rate_filters_[i];
+    }
+    
+    if (mode_ == Mode::RATE || setpoint.type == ControlSetpoint::RATE) {
+        // Direct rate control
+        updateRateControl(current_rates, setpoint.rates, output);
+    } else {
+        // Angle control - compute desired rates first
+        Attitude desired_attitude;
+        
+        if (setpoint.type == ControlSetpoint::ATTITUDE) {
+            desired_attitude = setpoint.attitude;
+        } else if (setpoint.type == ControlSetpoint::POSITION) {
+            // Position controller would provide attitude setpoint
+            desired_attitude = setpoint.attitude;
+        }
+        
+        // Angle controller outputs desired rates
+        AngularRates desired_rates = updateAngleControl(current_attitude, 
+                                                       desired_attitude);
+        
+        // Add yaw rate from setpoint
+        desired_rates.yaw_rate_rads = setpoint.rates.yaw_rate_rads;
+        
+        // Rate controller outputs final control
+        updateRateControl(current_rates, desired_rates, output);
+    }
+    
+    // Apply limits
+    limitOutputs(output);
+    
+    // Update adaptive gains if enabled
+    if (adaptive_enabled_) {
+        updateAdaptiveGains();
+    }
+    
+    // Update performance metrics
+    metrics_.update_count++;
+    
+    return output;
+}
+
+void AttitudeController::updateRateControl(const AngularRates& current_rates,
+                                         const AngularRates& desired_rates,
+                                         ControlOutput& output) {
+    // Compute rate errors
+    double roll_error = desired_rates.roll_rate_rads - current_rates.roll_rate_rads;
+    double pitch_error = desired_rates.pitch_rate_rads - current_rates.pitch_rate_rads;
+    double yaw_error = desired_rates.yaw_rate_rads - current_rates.yaw_rate_rads;
+    
+    // Update PID controllers
+    output.roll = rate_controllers_[0]->update(roll_error) * gain_scaling_[0];
+    output.pitch = rate_controllers_[1]->update(pitch_error) * gain_scaling_[1];
+    output.yaw = rate_controllers_[2]->update(yaw_error) * gain_scaling_[2];
+    
+    // Update metrics
+    metrics_.rate_error_rms[0] = 0.99 * metrics_.rate_error_rms[0] + 
+                                 0.01 * roll_error * roll_error;
+    metrics_.rate_error_rms[1] = 0.99 * metrics_.rate_error_rms[1] + 
+                                 0.01 * pitch_error * pitch_error;
+    metrics_.rate_error_rms[2] = 0.99 * metrics_.rate_error_rms[2] + 
+                                 0.01 * yaw_error * yaw_error;
+    
+    metrics_.control_effort[0] = 0.99 * metrics_.control_effort[0] + 
+                                0.01 * std::abs(output.roll);
+    metrics_.control_effort[1] = 0.99 * metrics_.control_effort[1] + 
+                                0.01 * std::abs(output.pitch);
+    metrics_.control_effort[2] = 0.99 * metrics_.control_effort[2] + 
+                                0.01 * std::abs(output.yaw);
+}
+
+AngularRates AttitudeController::updateAngleControl(const Attitude& current_attitude,
+                                                   const Attitude& desired_attitude) {
+    AngularRates desired_rates;
+    
+    // Compute angle errors
+    double roll_error = desired_attitude.roll_rad - current_attitude.roll_rad;
+    double pitch_error = desired_attitude.pitch_rad - current_attitude.pitch_rad;
+    
+    // Wrap angles to [-pi, pi]
+    while (roll_error > M_PI) roll_error -= 2 * M_PI;
+    while (roll_error < -M_PI) roll_error += 2 * M_PI;
+    while (pitch_error > M_PI) pitch_error -= 2 * M_PI;
+    while (pitch_error < -M_PI) pitch_error += 2 * M_PI;
+    
+    // Angle controllers output desired rates
+    desired_rates.roll_rate_rads = angle_controllers_[0]->update(roll_error);
+    desired_rates.pitch_rate_rads = angle_controllers_[1]->update(pitch_error);
+    
+    // Limit desired rates
+    double max_roll_rate_rads = max_roll_rate_dps_ * M_PI / 180.0;
+    double max_pitch_rate_rads = max_pitch_rate_dps_ * M_PI / 180.0;
+    
+    desired_rates.roll_rate_rads = std::max(-max_roll_rate_rads, 
+                                           std::min(max_roll_rate_rads, 
+                                                   desired_rates.roll_rate_rads));
+    desired_rates.pitch_rate_rads = std::max(-max_pitch_rate_rads, 
+                                            std::min(max_pitch_rate_rads, 
+                                                    desired_rates.pitch_rate_rads));
+    
+    // Update metrics
+    metrics_.angle_error_rms[0] = 0.99 * metrics_.angle_error_rms[0] + 
+                                 0.01 * roll_error * roll_error;
+    metrics_.angle_error_rms[1] = 0.99 * metrics_.angle_error_rms[1] + 
+                                 0.01 * pitch_error * pitch_error;
+    
+    return desired_rates;
+}
+
+void AttitudeController::updateAdaptiveGains() {
+    // Simple adaptive control based on error magnitude
+    // In practice, this would use more sophisticated adaptation laws
+    
+    for (int i = 0; i < 3; i++) {
+        double error_magnitude = std::sqrt(metrics_.rate_error_rms[i]);
+        
+        // Increase gains if error is high, decrease if oscillating
+        if (error_magnitude > 0.1) {  // High error
+            gain_scaling_[i] += adaptation_rate_;
+        } else if (metrics_.control_effort[i] > 0.8) {  // High control effort
+            gain_scaling_[i] -= adaptation_rate_;
+        }
+        
+        // Limit gain scaling
+        gain_scaling_[i] = std::max(0.5, std::min(1.5, gain_scaling_[i]));
+    }
+}
+
+void AttitudeController::limitOutputs(ControlOutput& output) {
+    // Limit control outputs to [-1, 1]
+    output.roll = std::max(-1.0, std::min(1.0, output.roll));
+    output.pitch = std::max(-1.0, std::min(1.0, output.pitch));
+    output.yaw = std::max(-1.0, std::min(1.0, output.yaw));
+    output.thrust = std::max(0.0, std::min(1.0, output.thrust));
+    
+    // Apply attitude limits when thrust is high
+    if (output.thrust > 0.1) {
+        double max_tilt = 0.5;  // Maximum tilt at high thrust
+        double tilt_mag = std::sqrt(output.roll * output.roll + 
+                                   output.pitch * output.pitch);
+        
+        if (tilt_mag > max_tilt) {
+            double scale = max_tilt / tilt_mag;
+            output.roll *= scale;
+            output.pitch *= scale;
+        }
+    }
+}
+
+void AttitudeController::setLimits(double max_roll_deg, double max_pitch_deg, 
+                                  double max_yaw_rate_dps) {
+    max_roll_deg_ = max_roll_deg;
+    max_pitch_deg_ = max_pitch_deg;
+    max_yaw_rate_dps_ = max_yaw_rate_dps;
+    
+    LOG_INFO("Attitude limits set - Roll: " << max_roll_deg << "°, Pitch: " 
+             << max_pitch_deg << "°, Yaw rate: " << max_yaw_rate_dps << "°/s");
+}
+
+void AttitudeController::setRateGains(int axis, double kp, double ki, double kd) {
+    if (axis < 0 || axis > 2) return;
+    
+    rate_controllers_[axis]->setGains(kp, ki, kd);
+    
+    const char* axis_names[] = {"Roll", "Pitch", "Yaw"};
+    LOG_INFO("Rate gains " << axis_names[axis] << " - P: " << kp 
+             << ", I: " << ki << ", D: " << kd);
+}
+
+void AttitudeController::setAngleGains(int axis, double kp, double ki, double kd) {
+    if (axis < 0 || axis > 1) return;
+    
+    angle_controllers_[axis]->setGains(kp, ki, kd);
+    
+    const char* axis_names[] = {"Roll", "Pitch"};
+    LOG_INFO("Angle gains " << axis_names[axis] << " - P: " << kp 
+             << ", I: " << ki << ", D: " << kd);
+}
+
+void AttitudeController::reset() {
+    for (auto& controller : rate_controllers_) {
+        controller->reset();
+    }
+    for (auto& controller : angle_controllers_) {
+        controller->reset();
+    }
+    
+    std::fill(rate_filters_.begin(), rate_filters_.end(), 0.0);
+    std::fill(gain_scaling_.begin(), gain_scaling_.end(), 1.0);
+    
+    prev_rates_ = AngularRates{};
+    metrics_ = PerformanceMetrics{};
+    
+    LOG_INFO("Attitude controller reset");
+}
+
+} // namespace rtfcs

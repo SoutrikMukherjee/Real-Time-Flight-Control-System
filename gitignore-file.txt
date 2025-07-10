@@ -1,0 +1,130 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+bin/
+lib/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+core
+vgcore.*
+
+# Coverage files
+*.gcda
+*.gcno
+*.gcov
+coverage/
+*.info
+coverage.xml
+htmlcov/
+
+# Documentation
+docs/html/
+docs/latex/
+doxygen_warnings.txt
+
+# Log files
+*.log
+logs/
+flight_logs/
+blackbox/
+
+# Configuration backups
+*.yaml.bak
+*.conf.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.pytest_cache/
+.coverage
+.env
+venv/
+
+# Test data
+test_data/
+*.test
+*.tmp
+
+# Mission files
+*.mission.bak
+
+# Calibration files
+calibration_*.yaml
+sensor_cal_*.dat
+
+# Performance profiling
+perf.data
+perf.data.old
+gmon.out
+callgrind.out.*
+
+# Package files
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+
+# Hardware specific
+device_tree_overlays/*.dtbo
+pin_mappings/*.backup
+
+# Temporary files
+*.tmp
+*.temp
+*.pid
+.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+.Trash-*
+
+# Editor backups
+*.orig
+*.rej
+*.bak
+
+# SITL simulator
+sitl_gazebo/
+sim_logs/
+
+# Third party
+third_party/googletest/
+third_party/FreeRTOS/
+third_party/mavlink/

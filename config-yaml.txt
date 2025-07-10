@@ -1,0 +1,301 @@
+# RTFCS Configuration File - Quadcopter Default Profile
+# Real-Time Flight Control System v2.3.1
+
+# Vehicle Configuration
+vehicle:
+  type: quadcopter
+  mass_kg: 2.5
+  arm_length_m: 0.3
+  motor_count: 4
+  
+  # Inertia matrix (kg*m^2)
+  inertia:
+    xx: 0.0123
+    yy: 0.0123
+    zz: 0.0224
+
+# System Configuration
+system:
+  enable_logging: true
+  log_level: INFO
+  log_directory: /var/log/rtfcs
+  max_log_size_mb: 1024
+  
+  # Real-time settings
+  control_thread_priority: 90
+  navigation_thread_priority: 70
+  telemetry_thread_priority: 50
+  
+  # Memory allocation
+  preallocate_memory: true
+  memory_pool_size_mb: 64
+
+# Safety Configuration
+safety:
+  enable_redundancy: true
+  enable_watchdog: true
+  watchdog_timeout_ms: 100
+  
+  # Failsafe actions
+  gps_loss_action: POSITION_HOLD
+  rc_loss_action: RETURN_TO_HOME
+  battery_critical_action: EMERGENCY_LAND
+  
+  # Pre-arm checks
+  prearm_checks:
+    - IMU_CALIBRATION
+    - GPS_FIX
+    - BATTERY_VOLTAGE
+    - RC_LINK
+    - SYSTEM_HEALTH
+
+# Sensor Configuration
+sensors:
+  imu_rate_hz: 1000
+  gps_rate_hz: 25
+  barometer_rate_hz: 100
+  magnetometer_rate_hz: 100
+  
+  # IMU settings
+  imu:
+    type: ICM42688P
+    spi_bus: 0
+    cs_pin: 8
+    interrupt_pin: 23
+    
+    # Calibration offsets
+    accel_offset: [0.05, -0.02, 0.01]
+    gyro_offset: [0.001, -0.002, 0.0005]
+    
+    # Low-pass filter cutoff frequencies
+    accel_lpf_hz: 20
+    gyro_lpf_hz: 80
+  
+  # GPS settings
+  gps:
+    type: UBLOX_M9N
+    uart_port: /dev/ttyS0
+    baud_rate: 115200
+    enable_rtk: false
+    enable_sbas: true
+  
+  # Barometer settings
+  barometer:
+    type: MS5611
+    i2c_bus: 1
+    address: 0x77
+    oversampling: 4096
+  
+  # Magnetometer settings
+  magnetometer:
+    type: RM3100
+    i2c_bus: 1
+    address: 0x20
+    sample_rate: 100
+    
+    # Hard iron calibration
+    offset: [-12.5, 23.1, -5.7]
+    
+    # Soft iron calibration matrix
+    scale:
+      - [1.02, 0.01, -0.02]
+      - [0.01, 0.98, 0.03]
+      - [-0.02, 0.03, 1.01]
+
+# Control Limits
+limits:
+  max_roll_deg: 45.0
+  max_pitch_deg: 45.0
+  max_yaw_rate_dps: 180.0
+  max_climb_rate_ms: 10.0
+  max_descent_rate_ms: 5.0
+  max_velocity_ms: 20.0
+  max_acceleration_mss: 5.0
+  
+  # Geofence
+  geofence_radius_m: 500.0
+  max_altitude_m: 400.0
+  min_altitude_m: 2.0
+  
+  # Battery limits
+  battery_cells: 4
+  battery_critical_voltage: 13.2
+  battery_warning_voltage: 14.0
+  battery_full_voltage: 16.8
+
+# Attitude Controller
+attitude_control:
+  # Roll rate PID
+  roll_rate:
+    kp: 0.15
+    ki: 0.1
+    kd: 0.004
+    imax: 0.3
+    filter_hz: 20.0
+  
+  # Pitch rate PID
+  pitch_rate:
+    kp: 0.15
+    ki: 0.1
+    kd: 0.004
+    imax: 0.3
+    filter_hz: 20.0
+  
+  # Yaw rate PID
+  yaw_rate:
+    kp: 0.3
+    ki: 0.05
+    kd: 0.0
+    imax: 0.2
+    filter_hz: 5.0
+  
+  # Roll angle PID
+  roll_angle:
+    kp: 6.0
+    ki: 0.0
+    kd: 0.0
+    imax: 0.0
+  
+  # Pitch angle PID
+  pitch_angle:
+    kp: 6.0
+    ki: 0.0
+    kd: 0.0
+    imax: 0.0
+
+# Position Controller
+position_control:
+  # Horizontal position PID
+  xy_position:
+    kp: 1.0
+    ki: 0.0
+    kd: 0.0
+    imax: 0.0
+    
+  # Horizontal velocity PID
+  xy_velocity:
+    kp: 2.0
+    ki: 0.5
+    kd: 0.1
+    imax: 1.0
+    filter_hz: 5.0
+  
+  # Altitude PID
+  altitude:
+    kp: 1.5
+    ki: 0.0
+    kd: 0.0
+    imax: 0.0
+  
+  # Vertical velocity PID
+  climb_rate:
+    kp: 4.0
+    ki: 1.5
+    kd: 0.0
+    imax: 3.0
+    filter_hz: 5.0
+
+# Navigation
+navigation:
+  waypoint_radius_m: 2.0
+  waypoint_speed_ms: 5.0
+  
+  # Path planning
+  obstacle_avoidance: true
+  obstacle_distance_m: 5.0
+  path_smoothing: true
+  
+  # Return to home
+  rth_altitude_m: 50.0
+  rth_speed_ms: 10.0
+  land_speed_ms: 0.5
+  final_land_altitude_m: 0.5
+
+# Motor Configuration
+motors:
+  # Motor mapping (for quadcopter X configuration)
+  # Motor 1: Front Left (CCW)
+  # Motor 2: Front Right (CW)  
+  # Motor 3: Rear Right (CCW)
+  # Motor 4: Rear Left (CW)
+  
+  protocol: DSHOT600
+  min_throttle: 1000
+  max_throttle: 2000
+  idle_throttle: 1150
+  
+  # Motor mixing matrix
+  # [roll, pitch, yaw, throttle]
+  mixing:
+    motor_1: [ 1.0,  1.0, -1.0, 1.0]
+    motor_2: [-1.0,  1.0,  1.0, 1.0]
+    motor_3: [-1.0, -1.0, -1.0, 1.0]
+    motor_4: [ 1.0, -1.0,  1.0, 1.0]
+
+# Communication
+communication:
+  # Telemetry
+  telemetry:
+    protocol: MAVLINK
+    uart_port: /dev/ttyS1
+    baud_rate: 57600
+    system_id: 1
+    component_id: 1
+  
+  # Ground control station
+  gcs:
+    enable: true
+    port: 14550
+    stream_rate_hz: 10
+  
+  # Onboard computer interface
+  companion:
+    enable: false
+    port: /dev/ttyS2
+    baud_rate: 921600
+
+# Logging
+logging:
+  # Flight data recorder
+  blackbox:
+    enable: true
+    rate_hz: 100
+    directory: /var/log/rtfcs/blackbox
+    max_size_mb: 1024
+    circular_buffer: true
+  
+  # Logged parameters
+  parameters:
+    - ATTITUDE
+    - POSITION
+    - VELOCITY
+    - MOTOR_OUTPUTS
+    - RC_INPUTS
+    - BATTERY
+    - GPS_STATUS
+    - SYSTEM_HEALTH
+
+# Advanced Features
+features:
+  # Adaptive control
+  adaptive_control:
+    enable: true
+    learning_rate: 0.001
+    forgetting_factor: 0.999
+    
+  # Neural network augmentation
+  neural_augmentation:
+    enable: false
+    model_path: /etc/rtfcs/models/attitude_nn.pb
+    
+  # Precision landing
+  precision_landing:
+    enable: false
+    marker_size_m: 0.5
+    approach_speed_ms: 1.0
+    
+  # Terrain following
+  terrain_following:
+    enable: false
+    target_altitude_m: 30.0
+    max_climb_angle_deg: 20.0

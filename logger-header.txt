@@ -1,0 +1,192 @@
+#ifndef RTFCS_LOGGER_HPP
+#define RTFCS_LOGGER_HPP
+
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <mutex>
+#include <memory>
+#include <queue>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <iomanip>
+
+namespace rtfcs {
+
+/**
+ * @brief Log levels
+ */
+enum class LogLevel {
+    DEBUG = 0,
+    INFO = 1,
+    WARN = 2,
+    ERROR = 3,
+    FATAL = 4
+};
+
+/**
+ * @brief Thread-safe logger with asynchronous file writing
+ * 
+ * Features:
+ * - Lock-free logging from real-time threads
+ * - Asynchronous file I/O to prevent blocking
+ * - Automatic log rotation
+ * - Structured logging with timestamps
+ * - Black box mode for crash analysis
+ */
+class Logger {
+public:
+    static Logger& getInstance() {
+        static Logger instance;
+        return instance;
+    }
+
+    /**
+     * @brief Initialize logger
+     * @param filename Base filename for logs
+     * @param max_size_mb Maximum log file size before rotation
+     * @param enable_console Enable console output
+     */
+    void initialize(const std::string& filename = "/var/log/rtfcs/flight.log",
+                   size_t max_size_mb = 100,
+                   bool enable_console = true);
+
+    /**
+     * @brief Set minimum log level
+     */
+    void setLevel(LogLevel level) { min_level_ = level; }
+
+    /**
+     * @brief Convert string to log level
+     */
+    static LogLevel stringToLevel(const std::string& level);
+
+    /**
+     * @brief Log a message
+     */
+    void log(LogLevel level, const std::string& file, int line, 
+             const std::string& function, const std::string& message);
+
+    /**
+     * @brief Enable black box mode (circular buffer)
+     * @param size_mb Size of circular buffer in MB
+     */
+    void enableBlackBox(size_t size_mb);
+
+    /**
+     * @brief Flush all pending logs
+     */
+    void flush();
+
+    /**
+     * @brief Stop logger and flush remaining messages
+     */
+    void shutdown();
+
+    // Delete copy operations
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+
+private:
+    Logger();
+    ~Logger();
+
+    /**
+     * @brief Writer thread function
+     */
+    void writerThread();
+
+    /**
+     * @brief Rotate log file if needed
+     */
+    void rotateLogFile();
+
+    /**
+     * @brief Format log message
+     */
+    std::string formatMessage(LogLevel level, const std::string& file, 
+                             int line, const std::string& function, 
+                             const std::string& message);
+
+    /**
+     * @brief Get current timestamp string
+     */
+    std::string getTimestamp();
+
+    /**
+     * @brief Get log level string
+     */
+    const char* getLevelString(LogLevel level);
+
+    // Configuration
+    std::atomic<LogLevel> min_level_{LogLevel::INFO};
+    std::string base_filename_;
+    size_t max_file_size_{100 * 1024 * 1024};  // 100MB default
+    bool console_enabled_{true};
+    bool initialized_{false};
+
+    // File handling
+    std::ofstream log_file_;
+    size_t current_file_size_{0};
+    int file_index_{0};
+
+    // Asynchronous logging
+    struct LogEntry {
+        std::string message;
+        LogLevel level;
+        std::chrono::system_clock::time_point timestamp;
+    };
+
+    std::queue<LogEntry> log_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread writer_thread_;
+    std::atomic<bool> running_{false};
+
+    // Black box mode
+    bool blackbox_enabled_{false};
+    std::vector<LogEntry> blackbox_buffer_;
+    size_t blackbox_index_{0};
+    size_t blackbox_size_{0};
+};
+
+// Convenience macros
+#define LOG_DEBUG(msg) do { \
+    std::ostringstream oss; \
+    oss << msg; \
+    rtfcs::Logger::getInstance().log(rtfcs::LogLevel::DEBUG, \
+        __FILE__, __LINE__, __FUNCTION__, oss.str()); \
+} while(0)
+
+#define LOG_INFO(msg) do { \
+    std::ostringstream oss; \
+    oss << msg; \
+    rtfcs::Logger::getInstance().log(rtfcs::LogLevel::INFO, \
+        __FILE__, __LINE__, __FUNCTION__, oss.str()); \
+} while(0)
+
+#define LOG_WARN(msg) do { \
+    std::ostringstream oss; \
+    oss << msg; \
+    rtfcs::Logger::getInstance().log(rtfcs::LogLevel::WARN, \
+        __FILE__, __LINE__, __FUNCTION__, oss.str()); \
+} while(0)
+
+#define LOG_ERROR(msg) do { \
+    std::ostringstream oss; \
+    oss << msg; \
+    rtfcs::Logger::getInstance().log(rtfcs::LogLevel::ERROR, \
+        __FILE__, __LINE__, __FUNCTION__, oss.str()); \
+} while(0)
+
+#define LOG_FATAL(msg) do { \
+    std::ostringstream oss; \
+    oss << msg; \
+    rtfcs::Logger::getInstance().log(rtfcs::LogLevel::FATAL, \
+        __FILE__, __LINE__, __FUNCTION__, oss.str()); \
+} while(0)
+
+} // namespace rtfcs
+
+#endif // RTFCS_LOGGER_HPP
